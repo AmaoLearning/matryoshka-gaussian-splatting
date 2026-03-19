@@ -6,7 +6,7 @@
 
 University of Cambridge, Chalmers University of Technology, Google
 
-> The ability to render scenes at adjustable fidelity from a single model, known as level of detail (LoD), is crucial for practical deployment of 3D Gaussian Splatting (3DGS). Existing discrete LoD methods expose only a limited set of operating points, while concurrent continuous LoD approaches enable smoother scaling but often suffer noticeable quality degradation at full capacity, making LoD a costly design decision. We introduce *Matryoshka Gaussian Splatting (MGS)*, a training framework that enables continuous LoD for standard 3DGS pipelines without sacrificing full-capacity rendering quality. MGS learns a single ordered set of Gaussians such that rendering any prefix -- the first *k* splats -- produces a coherent reconstruction whose fidelity improves smoothly with increasing budget. Our key idea is *stochastic budget training*: each iteration samples a random splat budget and optimises both the corresponding prefix and the full set. This strategy requires only two forward passes and introduces no architectural modifications. Experiments across four benchmarks and six baselines show that MGS matches the full-capacity performance of its backbone while enabling a continuous speed-quality trade-off from a single model.
+> Matryoshka Gaussian Splatting (MGS) is a training framework that enables continuous level-of-detail (LoD) for 3D Gaussian Splatting without sacrificing full-capacity rendering quality. MGS learns a single ordered set of Gaussians so that rendering any prefix -- the first *k* splats -- produces a coherent reconstruction that maintains high fidelity even at reduced budgets. The method requires only two forward passes per iteration and no architectural modifications.
 
 ![MGS framework overview](figures/overview.png)
 
@@ -87,7 +87,7 @@ bash command/train.sh 0 tanksandtemples truck
 bash command/train.sh 0 deepblending DrJohnson
 bash command/train.sh 0 bungeenerf rome
 ```
-**First run:** After "Model initialized", gsplat compiles CUDA kernels once (often 2–10 minutes); then the training loop and step counter start.
+**First run:**  If gsplat's CUDA kernels were not pre-compiled during installation, they will be compiled on first use (often 2 to 10 minutes).
 
 Checkpoints are saved to `../checkpoint/<BENCHMARK>/<SCENE>/ckpts/` (e.g. `../checkpoint/mipnerf360/bicycle/ckpts/`).
 
