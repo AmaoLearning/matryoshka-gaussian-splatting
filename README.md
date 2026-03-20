@@ -136,9 +136,9 @@ By default, evaluation runs at the 12 paper operating points: 100%, 90%, 80%, 70
 ## Citation
 
 ```bibtex
-@article{guo2026matryoshka,
+@article{guo2026matryoshkagaussiansplatting,
       title={Matryoshka Gaussian Splatting},
-      author={Guo, Zhilin and Zhang, Boqiao and Aktas, Hakan and Fogarty, Kyle and Hu, Jeffrey and Aslan, Nursena Koprucu and Li, Wenzhao and Baykal, Canberk and Miao, Albert and Bengtson, Josef and Zhou, Chenliang and Xia, Weihao and Vasconcelos, Cristina Nader and Oztireli, Cengiz},
+      author={Guo, Zhilin and Zhang, Boqiao and Aktas, Hakan and Fogarty, Kyle and Hu, Jeffrey and Aslan, Nursena Koprucu and Li, Wenzhao and Baykal, Canberk and Miao, Albert and Bengtson, Josef and Zhou, Chenliang and Xia, Weihao and Nader Vasconcelos, Cristina and Oztireli, Cengiz},
       journal={arXiv preprint arXiv:2603.19234},
       year={2026}
 }
