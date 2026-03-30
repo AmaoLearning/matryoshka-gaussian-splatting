@@ -30,4 +30,6 @@ tb/
 venv/
 .venv/
 
+*.md
+
 gsplat-build-py.patch

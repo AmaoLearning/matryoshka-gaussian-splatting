@@ -35,6 +35,12 @@ from mgs import (
     resolve_fixed_order_policy,
 )
 from mgs.utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
+from mgs.deformation import (
+    DeformationModule,
+    HexPlaneField,
+    apply_deformation,
+    rotation_6d_to_quaternion,
+)
 
 
 @dataclass
@@ -234,6 +240,30 @@ class Config:
     # Disable viewer (always True in this release; kept for CLI compatibility)
     disable_viewer: bool = True
 
+    # ===== Deformation field parameters (4D Gaussian) =====
+    # Enable deformation field for dynamic scene modeling
+    enable_deformation: bool = False
+    # HexPlane resolution [res_x, res_y, res_z, res_t]
+    deformation_resolution: List[int] = field(default_factory=lambda: [64, 64, 64, 150])
+    # HexPlane feature dimension per plane
+    deformation_feature_dim: int = 16
+    # Multi-resolution levels for HexPlane
+    deformation_multires: List[int] = field(default_factory=lambda: [1, 2])
+    # MLP hidden dimension
+    deformation_hidden_dim: int = 256
+    # MLP number of layers
+    deformation_num_layers: int = 2
+    # Predict opacity offset
+    deformation_predict_opacity: bool = False
+    # Predict SH coefficients offset
+    deformation_predict_sh: bool = False
+    # Learning rate for deformation module
+    deformation_lr: float = 1.6e-4
+    # Weight for deformation regularization (PlaneTV)
+    deformation_reg_weight: float = 1e-5
+    # Weight for time smoothness regularization
+    deformation_time_smooth_weight: float = 1e-4
+
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
         self.save_steps = [int(i * factor) for i in self.save_steps]
@@ -421,6 +451,21 @@ class Runner:
             load_depths=cfg.depth_loss,
             skip_t3=cfg.normalize_skip_t3,
         )
+        
+        # Auto-enable deformation for D-NeRF datasets
+        dataset_type = getattr(self.parser, "dataset_type", "")
+        if dataset_type == "dnerf" and cfg.enable_deformation:
+            print(
+                f"[INFO] D-NeRF dataset detected ({cfg.data_dir}). "
+                f"Deformation field is enabled."
+            )
+        elif dataset_type == "dnerf" and not cfg.enable_deformation:
+            cfg.enable_deformation = True
+            print(
+                f"[WARN] D-NeRF dataset detected but deformation is disabled. "
+                f"For dynamic scenes, consider using --enable_deformation."
+            )
+        
         if getattr(self.parser, "dataset_type", "") == "blender" and cfg.init_type == "sfm":
             raise ValueError(
                 "Blender/NeRF-Synthetic datasets do not provide COLMAP point clouds; "
@@ -551,6 +596,40 @@ class Runner:
         else:
             raise ValueError(f"Unknown LPIPS network: {cfg.lpips_net}")
 
+        # Deformation module.
+        self.deformation_module = None
+        self.deformation_optimizers = []
+        if cfg.enable_deformation:
+            self.hexplane = HexPlaneField(
+                resolution=cfg.deformation_resolution,
+                feature_dim=cfg.deformation_feature_dim,
+                multires=cfg.deformation_multires,
+                device=self.device,
+            ).to(self.device)
+            
+            # Compute feature dimension from multires
+            # HexPlane outputs: 6 planes * feature_dim * len(multires)
+            feature_dim_total = 6 * cfg.deformation_feature_dim * len(cfg.deformation_multires)
+            self.deformation_module = DeformationModule(
+                feature_dim=feature_dim_total,
+                hidden_dim=cfg.deformation_hidden_dim,
+                num_layers=cfg.deformation_num_layers,
+                predict_opacity=cfg.deformation_predict_opacity,
+                predict_sh=cfg.deformation_predict_sh,
+                sh_degree=cfg.sh_degree,
+                device=self.device,
+            ).to(self.device)
+            
+            self.deformation_optimizers = [
+                torch.optim.Adam(
+                    list(self.hexplane.parameters()) + 
+                    list(self.deformation_module.parameters()),
+                    lr=cfg.deformation_lr * math.sqrt(cfg.batch_size),
+                    eps=1e-15,
+                    betas=(0.9, 0.999),
+                )
+            ]
+
     def load_checkpoint(self, ckpt_paths: List[str]) -> int:
         ckpt_path = _select_resume_ckpt(
             ckpt_paths, world_rank=self.world_rank, world_size=self.world_size
@@ -580,6 +659,21 @@ class Runner:
             else:
                 self.app_module.load_state_dict(ckpt["app_module"])
 
+        if self.cfg.enable_deformation:
+            if "hexplane" in ckpt:
+                if self.world_size > 1:
+                    self.hexplane.module.load_state_dict(ckpt["hexplane"])
+                else:
+                    self.hexplane.load_state_dict(ckpt["hexplane"])
+            if "deformation_module" in ckpt:
+                if self.world_size > 1:
+                    self.deformation_module.module.load_state_dict(ckpt["deformation_module"])
+                else:
+                    self.deformation_module.load_state_dict(ckpt["deformation_module"])
+            if "deformation_optimizers" in ckpt and self.deformation_optimizers:
+                for opt, state in zip(self.deformation_optimizers, ckpt["deformation_optimizers"]):
+                    opt.load_state_dict(state)
+
         if "strategy_state" in ckpt:
             self.strategy_state = ckpt["strategy_state"]
         if self.fixed_order_policy is not None:
@@ -601,8 +695,17 @@ class Runner:
         self.start_step = max(step + 1, 0)
         return step
 
-    def _build_subset_overrides(self, subset_indices: torch.Tensor) -> Dict[str, Tensor]:
-        """Slice the current splats into a subset used for inference."""
+    def _build_subset_overrides(self, subset_indices: torch.Tensor, apply_deformation_fn: bool = False, time_coords: Optional[torch.Tensor] = None) -> Dict[str, Tensor]:
+        """Slice the current splats into a subset used for inference.
+        
+        Args:
+            subset_indices: Indices of splats to include in the subset
+            apply_deformation_fn: Whether to apply deformation field
+            time_coords: Time coordinates (B,) for deformation, only used if apply_deformation_fn=True
+        
+        Returns:
+            Dictionary of splat parameters for the subset
+        """
         subset_indices = subset_indices.to(self.device).long()
         overrides: Dict[str, Tensor] = {
             "means": torch.index_select(self.splats["means"], 0, subset_indices),
@@ -626,6 +729,51 @@ class Runner:
             overrides["shN"] = torch.index_select(
                 self.splats["shN"], 0, subset_indices
             )
+        
+        # Apply deformation if enabled
+        if apply_deformation_fn and self.cfg.enable_deformation and time_coords is not None:
+            N = overrides["means"].shape[0]
+            B = time_coords.shape[0]
+            
+            # Expand time coordinates to match splats
+            time_expanded = time_coords.view(-1, 1, 1).expand(B, N, 1)  # (B, N, 1)
+            
+            # Normalize coordinates to [-1, 1] for HexPlane
+            # Assuming means are in world space and time is in [0, num_frames]
+            coords_norm = torch.cat([
+                overrides["means"].unsqueeze(0).expand(B, -1, -1),  # (B, N, 3)
+                time_expanded
+            ], dim=-1)  # (B, N, 4)
+            
+            # Normalize spatial coordinates based on scene extent
+            # This is a simplification - in practice, you'd want proper AABB bounds
+            coords_norm[..., :3] = coords_norm[..., :3] / (self.scene_scale * 2.0)
+            coords_norm[..., 3] = coords_norm[..., 3] * 2.0 - 1.0  # Assuming time in [0, 1]
+            
+            # Query HexPlane
+            features = self.hexplane(coords_norm)  # (B, N, feature_dim)
+            
+            # Get deformation offsets (use first batch for now)
+            dx, ds, dr, do, dsh = self.deformation_module(features[0])  # (N, ...)
+            
+            # Apply deformation
+            deformed = apply_deformation(
+                means=overrides["means"],
+                scales=overrides["scales"],
+                quats=overrides["quats"],
+                opacities=overrides["opacities"],
+                sh_coeffs=overrides.get("shN", None),
+                dx=dx,
+                ds=ds,
+                dr=dr,
+                do=do,
+                dsh=dsh,
+            )
+            
+            overrides["means"], overrides["scales"], overrides["quats"], overrides["opacities"], sh_deformed = deformed
+            if sh_deformed is not None:
+                overrides["shN"] = sh_deformed
+        
         return overrides
 
     @staticmethod
@@ -830,18 +978,27 @@ class Runner:
                 is_full = bool(subset["is_full"])
                 weight = float(subset["weight"])
 
-                subset_overrides: Dict[str, Tensor] = {
-                    "means": self.splats["means"][subset_indices],
-                    "quats": self.splats["quats"][subset_indices],
-                    "scales": self.splats["scales"][subset_indices],
-                    "opacities": self.splats["opacities"][subset_indices],
-                }
-                if cfg.app_opt:
-                    subset_overrides["features"] = self.splats["features"][subset_indices]
-                    subset_overrides["colors"] = self.splats["colors"][subset_indices]
-                else:
-                    subset_overrides["sh0"] = self.splats["sh0"][subset_indices]
-                    subset_overrides["shN"] = self.splats["shN"][subset_indices]
+                # Apply deformation if enabled
+                time_coords = None
+                if cfg.enable_deformation:
+                    # Get time coordinate from dataset
+                    # Assuming dataset provides 'time' or 'frame_id' field
+                    if "time" in data:
+                        time_coords = data["time"].to(device)  # [B,] or [B, 1]
+                    elif "frame_id" in data:
+                        # Normalize frame_id to [0, 1]
+                        max_frames = len(self.trainset)
+                        time_coords = data["frame_id"].float().to(device) / max_frames
+                    
+                    if time_coords is None:
+                        # Default to time=0 if not provided
+                        time_coords = torch.zeros((1,), device=device)
+
+                subset_overrides: Dict[str, Tensor] = self._build_subset_overrides(
+                    subset_indices=subset_indices,
+                    apply_deformation_fn=cfg.enable_deformation,
+                    time_coords=time_coords,
+                )
 
                 renders, alphas, info_k = self.rasterize_splats(
                     camtoworlds=camtoworlds,
@@ -947,6 +1104,44 @@ class Runner:
                 total_loss = total_loss + cfg.scale_reg * torch.exp(
                     self.splats["scales"]
                 ).mean()
+            
+            # Deformation regularization (PlaneTV + time smoothness)
+            if cfg.enable_deformation and cfg.deformation_reg_weight > 0.0:
+                # Sample random points in 4D space for PlaneTV regularization
+                num_samples = 1000
+                coords = torch.rand((num_samples, 4), device=device) * 2 - 1  # [-1, 1]
+                coords.requires_grad_(True)
+                
+                # Query HexPlane
+                features = self.hexplane(coords.unsqueeze(0))[0]  # (N, feature_dim)
+                
+                # Compute gradients of features w.r.t. coordinates
+                grad = torch.autograd.grad(
+                    features.sum(),
+                    coords,
+                    create_graph=True,
+                    retain_graph=True,
+                )[0]  # (N, 4)
+                
+                # PlaneTV: encourage sparse gradients
+                plane_tv_loss = grad.abs().mean()
+                total_loss = total_loss + cfg.deformation_reg_weight * plane_tv_loss
+            
+            if cfg.enable_deformation and cfg.deformation_time_smooth_weight > 0.0:
+                # Time smoothness: encourage similar features at same spatial location but different times
+                num_samples = 500
+                xyz = torch.rand((num_samples, 3), device=device) * 2 - 1  # [-1, 1]
+                t1 = torch.rand((num_samples, 1), device=device)  # [0, 1]
+                t2 = t1 + 0.1  # adjacent time
+                
+                coords1 = torch.cat([xyz, t1], dim=-1)
+                coords2 = torch.cat([xyz, t2], dim=-1)
+                
+                features1 = self.hexplane(coords1.unsqueeze(0))[0]
+                features2 = self.hexplane(coords2.unsqueeze(0))[0]
+                
+                time_smooth_loss = (features1 - features2).abs().mean()
+                total_loss = total_loss + cfg.deformation_time_smooth_weight * time_smooth_loss
 
             loss = total_loss
             loss.backward()
@@ -1026,6 +1221,16 @@ class Runner:
                         data["app_module"] = self.app_module.state_dict()
                     data["app_optimizers"] = [
                         opt.state_dict() for opt in self.app_optimizers
+                    ]
+                if cfg.enable_deformation:
+                    if world_size > 1:
+                        data["hexplane"] = self.hexplane.module.state_dict()
+                        data["deformation_module"] = self.deformation_module.module.state_dict()
+                    else:
+                        data["hexplane"] = self.hexplane.state_dict()
+                        data["deformation_module"] = self.deformation_module.state_dict()
+                    data["deformation_optimizers"] = [
+                        opt.state_dict() for opt in self.deformation_optimizers
                     ]
                 torch.save(
                     data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"

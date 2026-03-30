@@ -5,6 +5,14 @@ from mgs.subset_scheduler import (
     compute_mrl_nesting_sizes,
     compute_mrl_nesting_sizes_paper,
 )
+from mgs.deformation import (
+    HexPlaneField,
+    DeformationModule,
+    apply_deformation,
+    rotation_6d_to_quaternion,
+    quaternion_multiply,
+    matrix_to_quaternion,
+)
 
 __all__ = [
     "SplatSorter",
@@ -13,4 +21,11 @@ __all__ = [
     "compute_mrl_nesting_sizes",
     "compute_mrl_nesting_sizes_paper",
     "resolve_fixed_order_policy",
+    # Deformation
+    "HexPlaneField",
+    "DeformationModule",
+    "apply_deformation",
+    "rotation_6d_to_quaternion",
+    "quaternion_multiply",
+    "matrix_to_quaternion",
 ]

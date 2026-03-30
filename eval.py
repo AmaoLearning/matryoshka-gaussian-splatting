@@ -40,6 +40,7 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from datasets.auto import build_parser_and_datasets
 from gsplat.rendering import rasterization
 from mgs.sorting import SplatSorter
+from mgs.deformation import apply_deformation, HexPlaneField, DeformationModule
 
 
 PAPER_RATIOS = [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.05, 0.01]
@@ -62,6 +63,14 @@ def parse_args():
     parser.add_argument("--save_images", action="store_true", help="Save rendered images")
     parser.add_argument("--sort_strategy", type=str, default="by_opacity_descending",
                         help="Sorting strategy for prefix ordering")
+    parser.add_argument("--enable_deformation", action="store_true", 
+                        help="Enable deformation module for dynamic scenes")
+    parser.add_argument("--deformation_resolution", type=int, nargs="+", default=[64, 64, 64, 150],
+                        help="HexPlane resolution [res_x, res_y, res_z, res_t]")
+    parser.add_argument("--deformation_feature_dim", type=int, default=16,
+                        help="HexPlane feature dimension")
+    parser.add_argument("--deformation_multires", type=int, nargs="+", default=[1, 2],
+                        help="Multi-resolution levels")
     return parser.parse_args()
 
 
@@ -77,14 +86,21 @@ def load_checkpoint(path, device):
     return splats, ckpt.get("step", -1)
 
 
-def build_subset(splats, subset_indices):
+def build_subset(splats, subset_indices, hexplane=None, deformation_module=None, time_coord=None):
     """Pre-slice and activate splat tensors for a given subset.
 
     Applies exp/sigmoid/cat once per ratio so the per-frame timing loop
     measures only the rasterization kernel.
+    
+    Args:
+        splats: ParameterDict of all splat parameters
+        subset_indices: Indices of splats to include
+        hexplane: HexPlaneField module (optional, for deformation)
+        deformation_module: DeformationModule (optional, for deformation)
+        time_coord: Time coordinate scalar (optional, for deformation)
     """
     idx = subset_indices
-    return {
+    subset = {
         "means": torch.index_select(splats["means"], 0, idx),
         "quats": torch.index_select(splats["quats"], 0, idx),
         "scales": torch.exp(torch.index_select(splats["scales"], 0, idx)),
@@ -95,6 +111,45 @@ def build_subset(splats, subset_indices):
             dim=1,
         ),
     }
+    
+    # Apply deformation if modules are provided
+    if hexplane is not None and deformation_module is not None and time_coord is not None:
+        N = subset["means"].shape[0]
+        
+        # Normalize coordinates for HexPlane
+        coords = torch.cat([
+            subset["means"].unsqueeze(0),  # (1, N, 3)
+            torch.full((1, N, 1), time_coord, device=subset["means"].device)  # (1, N, 1)
+        ], dim=-1)  # (1, N, 4)
+        
+        # Normalize spatial coordinates
+        coords[..., :3] = coords[..., :3] / 2.0  # Simplified normalization
+        
+        # Query HexPlane and get deformation
+        features = hexplane(coords)[0]  # (N, feature_dim)
+        dx, ds, dr, do, dsh = deformation_module(features)
+        
+        # Apply deformation
+        deformed = apply_deformation(
+            means=subset["means"],
+            scales=torch.log(subset["scales"]),  # Convert back to log space
+            quats=subset["quats"],
+            opacities=torch.logit(subset["opacities"]),  # Convert back to logit space
+            sh_coeffs=subset["colors"][:, 1:, :],  # Higher order SH
+            dx=dx,
+            ds=ds,
+            dr=dr,
+            do=do,
+            dsh=dsh,
+        )
+        
+        subset["means"], subset["scales"], subset["quats"], subset["opacities"], sh_deformed = deformed
+        subset["scales"] = torch.exp(subset["scales"])  # Exp for rasterization
+        subset["opacities"] = torch.sigmoid(subset["opacities"])  # Sigmoid for rasterization
+        if sh_deformed is not None:
+            subset["colors"] = torch.cat([subset["colors"][:, :1, :], sh_deformed], dim=1)
+    
+    return subset
 
 
 def rasterize_subset(subset, camtoworlds, Ks, width, height, sh_degree, packed=False):
@@ -131,6 +186,36 @@ def main():
     total_splats = len(splats["means"])
     print(f"Checkpoint: {total_splats:,} Gaussians, step {step}")
 
+    # Load deformation module if enabled
+    hexplane = None
+    deformation_module = None
+    if args.enable_deformation:
+        print("Loading deformation module...")
+        ckpt_full, _ = load_checkpoint(args.ckpt, device)
+        
+        if "hexplane" in ckpt_full:
+            hexplane = HexPlaneField(
+                resolution=args.deformation_resolution,
+                feature_dim=args.deformation_feature_dim,
+                multires=args.deformation_multires,
+                device=str(device),
+            ).to(device)
+            hexplane.load_state_dict(ckpt_full["hexplane"])
+            hexplane.eval()
+            
+            # Compute feature dimension: 6 planes * feature_dim * len(multires)
+            feature_dim_total = 6 * args.deformation_feature_dim * len(args.deformation_multires)
+            deformation_module = DeformationModule(
+                feature_dim=feature_dim_total,
+                device=str(device),
+            ).to(device)
+            deformation_module.load_state_dict(ckpt_full["deformation_module"])
+            deformation_module.eval()
+            
+            print(f"Deformation module loaded: HexPlane + MLP")
+        else:
+            print("WARNING: Checkpoint does not contain deformation module, but --enable_deformation is set")
+
     print(f"Loading dataset: {args.data_dir}")
     parser_obj, _, valset = build_parser_and_datasets(
         data_dir=args.data_dir,
@@ -159,12 +244,20 @@ def main():
         for ratio in ratios:
             n_keep = max(1, min(total_splats, int(round(ratio * total_splats))))
             subset_idx = sort_indices[:n_keep].to(device)
-            subset = build_subset(splats, subset_idx)
+            
+            # For FPS pass, use time=0 or average over time
+            time_coord = 0.0
+            subset = build_subset(splats, subset_idx, hexplane, deformation_module, time_coord=time_coord)
             times = []
             for i, data in enumerate(dataloader):
                 camtoworlds = data["camtoworld"].to(device)
                 Ks = data["K"].to(device)
                 height, width = data["image"].shape[1:3]
+                
+                # Get time coordinate from data if available
+                if hexplane is not None and "time" in data:
+                    time_coord_i = data["time"].item() if "time" in data else data.get("frame_id", 0.0)
+                    subset = build_subset(splats, subset_idx, hexplane, deformation_module, time_coord=time_coord_i)
 
                 torch.cuda.synchronize()
                 tic = time.time()
@@ -195,7 +288,6 @@ def main():
         for ratio in ratios:
             n_keep = max(1, min(total_splats, int(round(ratio * total_splats))))
             subset_idx = sort_indices[:n_keep].to(device)
-            subset = build_subset(splats, subset_idx)
             metrics = defaultdict(list)
             if args.save_images:
                 img_dir = output_dir / f"ratio_{ratio:.2f}"
@@ -205,6 +297,18 @@ def main():
                 Ks = data["K"].to(device)
                 pixels = data["image"].to(device) / 255.0
                 height, width = pixels.shape[1:3]
+                
+                # Get time coordinate for this frame
+                time_coord = 0.0
+                if hexplane is not None:
+                    if "time" in data:
+                        time_coord = data["time"].item()
+                    elif "frame_id" in data:
+                        time_coord = data["frame_id"].item()
+                
+                # Build subset with deformation for this frame's time
+                subset = build_subset(splats, subset_idx, hexplane, deformation_module, time_coord=time_coord)
+                
                 render_colors, _, _ = rasterize_subset(
                     subset, camtoworlds, Ks, width, height, args.sh_degree
                 )
