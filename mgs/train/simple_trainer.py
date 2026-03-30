@@ -733,22 +733,28 @@ class Runner:
         # Apply deformation if enabled
         if apply_deformation_fn and self.cfg.enable_deformation and time_coords is not None:
             N = overrides["means"].shape[0]
-            B = time_coords.shape[0]
             
-            # Expand time coordinates to match splats
-            time_expanded = time_coords.view(-1, 1, 1).expand(B, N, 1)  # (B, N, 1)
+            # time_coords shape: (B,) or (B, 1)
+            # Reshape to (B, 1) and expand to (B, N, 1)
+            if time_coords.dim() == 1:
+                time_coords = time_coords.unsqueeze(-1)  # (B, 1)
             
-            # Normalize coordinates to [-1, 1] for HexPlane
-            # Assuming means are in world space and time is in [0, num_frames]
-            coords_norm = torch.cat([
-                overrides["means"].unsqueeze(0).expand(B, -1, -1),  # (B, N, 3)
-                time_expanded
-            ], dim=-1)  # (B, N, 4)
+            # Expand time to match all Gaussians
+            time_expanded = time_coords.unsqueeze(1).expand(-1, N, -1)  # (B, N, 1)
             
-            # Normalize spatial coordinates based on scene extent
-            # This is a simplification - in practice, you'd want proper AABB bounds
-            coords_norm[..., :3] = coords_norm[..., :3] / (self.scene_scale * 2.0)
-            coords_norm[..., 3] = coords_norm[..., 3] * 2.0 - 1.0  # Assuming time in [0, 1]
+            # Prepare spatial coordinates (Gaussian means)
+            # means shape: (N, 3), expand to (B, N, 3)
+            means_expanded = overrides["means"].unsqueeze(0).expand(time_coords.shape[0], -1, -1)  # (B, N, 3)
+            
+            # Concatenate: (B, N, 4) = (x, y, z, t)
+            coords = torch.cat([means_expanded, time_expanded], dim=-1)
+            
+            # Normalize coordinates to [-1, 1] for grid_sample
+            # Spatial: divide by scene_scale to get [-1, 1] range
+            # Temporal: already in [0, 1], map to [-1, 1]
+            coords_norm = coords.clone()
+            coords_norm[..., :3] = coords[..., :3] / self.scene_scale  # [-1, 1] assuming centered
+            coords_norm[..., 3] = coords[..., 3] * 2.0 - 1.0  # [0, 1] -> [-1, 1]
             
             # Query HexPlane
             features = self.hexplane(coords_norm)  # (B, N, feature_dim)

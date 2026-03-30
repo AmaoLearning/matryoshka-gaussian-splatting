@@ -90,7 +90,9 @@ class HexPlaneField(nn.Module):
                     raise ValueError(f"Unknown plane dimension: {dim_str}")
                 
                 # Reshape for grid_sample: (B, 1, N, 2)
-                grid = grid_coords.unsqueeze(1).unsqueeze(1)
+                # grid_sample expects: input (B, C, H, W), grid (B, H_out, W_out, 2)
+                # We treat N points as a 1×N image
+                grid = grid_coords.unsqueeze(1)  # (B, 1, N, 2)
                 
                 # Sample from plane: (B, feature_dim, 1, N)
                 sampled = F.grid_sample(
