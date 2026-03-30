@@ -176,11 +176,10 @@ class Parser(BlenderParser):
         dists = np.linalg.norm(cam_locs - scene_center, axis=1)
         self.scene_scale = float(np.max(dists)) if len(dists) else 1.0
         
-        # Empty point cloud (D-NeRF doesn't provide SfM points)
-        self.points = np.zeros((0, 3), dtype=np.float32)
-        self.points_err = np.zeros((0,), dtype=np.float32)
-        self.points_rgb = np.zeros((0, 3), dtype=np.uint8)
-        self.point_indices: Dict[str, np.ndarray] = {}
+        # Try to load COLMAP point cloud if available (e.g., points3d.ply)
+        # This enables SFM-based Gaussian initialization for D-NeRF
+        self.points, self.points_err, self.points_rgb, self.point_indices = \
+            self._load_colmap_point_cloud()
         
         # Bounding boxes for rendering
         self.extconf = {"spiral_radius_scale": 1.0, "no_factor_suffix": True}
@@ -195,6 +194,10 @@ class Parser(BlenderParser):
             f"factor={factor} size=({width}x{height}) "
             f"time_range=[{self.times.min():.3f}, {self.times.max():.3f}]"
         )
+        if len(self.points) > 0:
+            print(f"  ✓ Loaded COLMAP point cloud: {len(self.points)} points")
+        else:
+            print(f"  ⚠ No COLMAP point cloud found (use --init_type random)")
     
     def _load_json(self, path: str) -> Dict[str, Any]:
         """Load JSON file."""
@@ -306,6 +309,190 @@ class Parser(BlenderParser):
                     return str(candidate)
         
         return str(p)
+    
+    def _load_colmap_point_cloud(self):
+        """
+        Load COLMAP point cloud from points3d.ply, points3d.bin, or points3d.txt.
+        
+        D-NeRF datasets may include COLMAP sparse reconstruction in various formats:
+        - points3d.ply: PLY format point cloud
+        - points3d.bin: COLMAP binary format
+        - points3d.txt: COLMAP text format
+        
+        Returns:
+            points: np.ndarray [N, 3] - 3D point coordinates
+            points_err: np.ndarray [N,] - reprojection errors
+            points_rgb: np.ndarray [N, 3] - RGB colors (0-255)
+            point_indices: Dict[str, np.ndarray] - image_name -> point indices
+        """
+        import struct
+        
+        # Search for COLMAP sparse reconstruction
+        sparse_dirs = [
+            os.path.join(self.data_dir, "sparse", "0"),
+            os.path.join(self.data_dir, "sparse"),
+            self.data_dir,
+        ]
+        
+        for sparse_dir in sparse_dirs:
+            if not os.path.exists(sparse_dir):
+                continue
+            
+            # Try points3d.ply first
+            ply_file = os.path.join(sparse_dir, "points3d.ply")
+            if os.path.exists(ply_file):
+                return self._load_ply_file(ply_file)
+            
+            # Try points3d.bin (COLMAP binary format)
+            bin_file = os.path.join(sparse_dir, "points3d.bin")
+            if os.path.exists(bin_file):
+                return self._load_colmap_bin_file(bin_file)
+            
+            # Try points3d.txt (COLMAP text format)
+            txt_file = os.path.join(sparse_dir, "points3d.txt")
+            if os.path.exists(txt_file):
+                return self._load_colmap_txt_file(txt_file)
+        
+        # No point cloud found
+        return (
+            np.zeros((0, 3), dtype=np.float32),
+            np.zeros((0,), dtype=np.float32),
+            np.zeros((0, 3), dtype=np.uint8),
+            {}
+        )
+    
+    def _load_ply_file(self, ply_path: str):
+        """Load PLY format point cloud (COLMAP style)."""
+        try:
+            with open(ply_path, "rb") as f:
+                # Read header
+                header_lines = []
+                while True:
+                    line = f.readline().decode("utf-8").strip()
+                    header_lines.append(line)
+                    if line == "end_header":
+                        break
+                
+                # Parse header for number of vertices
+                num_points = 0
+                for line in header_lines:
+                    if line.startswith("element vertex"):
+                        num_points = int(line.split()[-1])
+                        break
+                
+                # Check if binary or ASCII
+                is_binary = "binary_little_endian" in str(header_lines)
+                
+                if is_binary:
+                    # Binary PLY: x, y, z, nx, ny, nz, red, green, blue
+                    dtype = np.dtype([
+                        ('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
+                        ('nx', '<f4'), ('ny', '<f4'), ('nz', '<f4'),
+                        ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')
+                    ])
+                    data = np.frombuffer(f.read(num_points * dtype.itemsize), dtype=dtype)
+                    
+                    points = np.column_stack([
+                        data['x'], data['y'], data['z']
+                    ]).astype(np.float32)
+                    points_rgb = np.column_stack([
+                        data['red'], data['green'], data['blue']
+                    ]).astype(np.uint8)
+                    points_err = np.zeros(len(points), dtype=np.float32)
+                else:
+                    # ASCII PLY
+                    points = []
+                    points_rgb = []
+                    for _ in range(num_points):
+                        line = f.readline().decode("utf-8").strip()
+                        values = list(map(float, line.split()))
+                        if len(values) >= 6:
+                            points.append(values[:3])
+                            if len(values) >= 9:
+                                # Assume RGB in 0-255 or 0-1 range
+                                if values[6] > 1.0:
+                                    points_rgb.append(values[6:9])
+                                else:
+                                    points_rgb.append([v * 255 for v in values[6:9]])
+                    
+                    points = np.array(points, dtype=np.float32) if points else \
+                             np.zeros((0, 3), dtype=np.float32)
+                    points_rgb = np.array(points_rgb, dtype=np.uint8) if points_rgb else \
+                                 np.zeros((len(points), 3), dtype=np.uint8)
+                    points_err = np.zeros(len(points), dtype=np.float32)
+                
+                point_indices = {}  # PLY doesn't have image-point associations
+                return points, points_err, points_rgb, point_indices
+                
+        except Exception as e:
+            print(f"[WARN] Failed to load PLY file {ply_path}: {e}")
+            return (
+                np.zeros((0, 3), dtype=np.float32),
+                np.zeros((0,), dtype=np.float32),
+                np.zeros((0, 3), dtype=np.uint8),
+                {}
+            )
+    
+    def _load_colmap_bin_file(self, bin_path: str):
+        """Load COLMAP binary format point cloud."""
+        try:
+            from pycolmap import SceneManager
+            manager = SceneManager(os.path.dirname(bin_path))
+            manager.load_cameras()
+            manager.load_images()
+            manager.load_points3D()
+            
+            points = manager.points3D.astype(np.float32)
+            points_err = manager.point3D_errors.astype(np.float32)
+            points_rgb = manager.point3D_colors.astype(np.uint8)
+            
+            # Build point_indices mapping (image_name -> point indices)
+            point_indices = {}
+            image_id_to_name = {v: k for k, v in manager.name_to_image_id.items()}
+            for point_id, data in manager.point3D_id_to_images.items():
+                for image_id, _ in data:
+                    image_name = image_id_to_name[image_id]
+                    point_idx = manager.point3D_id_to_point3D_idx[point_id]
+                    point_indices.setdefault(image_name, []).append(point_idx)
+            point_indices = {
+                k: np.array(v).astype(np.int32) for k, v in point_indices.items()
+            }
+            
+            return points, points_err, points_rgb, point_indices
+            
+        except Exception as e:
+            print(f"[WARN] Failed to load COLMAP bin file {bin_path}: {e}")
+            return (
+                np.zeros((0, 3), dtype=np.float32),
+                np.zeros((0,), dtype=np.float32),
+                np.zeros((0, 3), dtype=np.uint8),
+                {}
+            )
+    
+    def _load_colmap_txt_file(self, txt_path: str):
+        """Load COLMAP text format point cloud."""
+        try:
+            from pycolmap import SceneManager
+            manager = SceneManager(os.path.dirname(txt_path))
+            manager.load_cameras()
+            manager.load_images()
+            manager.load_points3D()
+            
+            points = manager.points3D.astype(np.float32)
+            points_err = manager.point3D_errors.astype(np.float32)
+            points_rgb = manager.point3D_colors.astype(np.uint8)
+            point_indices = {}
+            
+            return points, points_err, points_rgb, point_indices
+            
+        except Exception as e:
+            print(f"[WARN] Failed to load COLMAP txt file {txt_path}: {e}")
+            return (
+                np.zeros((0, 3), dtype=np.float32),
+                np.zeros((0,), dtype=np.float32),
+                np.zeros((0, 3), dtype=np.uint8),
+                {}
+            )
 
 
 class Dataset(BlenderDataset):
