@@ -9,8 +9,9 @@
 #   bash command/eval.sh 1 tanksandtemples truck
 #   bash command/eval.sh 2 deepblending DrJohnson
 #   bash command/eval.sh 3 bungeenerf rome
+#   bash command/eval.sh 0 dnerf bouncingballs
 #
-# Benchmarks: mipnerf360, tanksandtemples, deepblending, bungeenerf
+# Benchmarks: mipnerf360, tanksandtemples, deepblending, bungeenerf, dnerf
 
 set -euo pipefail
 
@@ -18,8 +19,8 @@ if [ $# -ne 3 ]; then
     echo "Usage: bash command/eval.sh <GPU> <BENCHMARK> <SCENE>"
     echo ""
     echo "  GPU          CUDA device index (e.g. 0)"
-    echo "  BENCHMARK    mipnerf360 | tanksandtemples | deepblending | bungeenerf"
-    echo "  SCENE        scene name (e.g. bicycle, truck, DrJohnson, rome)"
+    echo "  BENCHMARK    mipnerf360 | tanksandtemples | deepblending | bungeenerf | dnerf"
+    echo "  SCENE        scene name (e.g. bicycle, truck, DrJohnson, rome, bouncingballs)"
     exit 1
 fi
 
@@ -51,13 +52,19 @@ case "$BENCHMARK" in
         DATA_DIR="${WORKSPACE_DIR}/benchmark/DeepBlending/${SCENE}"
         DATA_FACTOR=1
         ;;
+    dnerf)
+        DATA_DIR="${WORKSPACE_DIR}/benchmark/DNeRF/${SCENE}"
+        DATA_FACTOR=1
+        # D-NeRF requires deformation field for evaluation
+        DEFORMATION_ARGS="--enable_deformation"
+        ;;
     bungeenerf)
         DATA_DIR="${WORKSPACE_DIR}/benchmark/BungeeNeRF/${SCENE}"
         DATA_FACTOR=1
         ;;
     *)
         echo "Unknown benchmark: $BENCHMARK"
-        echo "Choose from: mipnerf360, tanksandtemples, deepblending, bungeenerf"
+        echo "Choose from: mipnerf360, tanksandtemples, deepblending, bungeenerf, dnerf"
         exit 1
         ;;
 esac
@@ -73,6 +80,9 @@ echo "Data dir:   ${DATA_DIR}"
 echo "Data factor:${DATA_FACTOR}"
 echo "Checkpoint: ${CKPT}"
 echo "Output dir: ${OUTPUT_DIR}"
+if [ "${BENCHMARK}" = "dnerf" ]; then
+    echo "Deformation: ENABLED (HexPlane)"
+fi
 echo "======================"
 
 CUDA_VISIBLE_DEVICES=${GPU} python "${REPO_DIR}/eval.py" \
@@ -80,4 +90,5 @@ CUDA_VISIBLE_DEVICES=${GPU} python "${REPO_DIR}/eval.py" \
     --data_dir "${DATA_DIR}" \
     --data_factor ${DATA_FACTOR} \
     --output_dir "${OUTPUT_DIR}" \
-    --save_images
+    --save_images \
+    ${DEFORMATION_ARGS:-}

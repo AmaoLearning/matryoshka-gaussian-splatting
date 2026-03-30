@@ -9,8 +9,9 @@
 #   bash command/train.sh 1 tanksandtemples truck
 #   bash command/train.sh 2 deepblending DrJohnson
 #   bash command/train.sh 3 bungeenerf rome
+#   bash command/train.sh 0 dnerf bouncingballs
 #
-# Benchmarks: mipnerf360, tanksandtemples, deepblending, bungeenerf
+# Benchmarks: mipnerf360, tanksandtemples, deepblending, bungeenerf, dnerf
 
 set -euo pipefail
 
@@ -18,8 +19,8 @@ if [ $# -ne 3 ]; then
     echo "Usage: bash command/train.sh <GPU> <BENCHMARK> <SCENE>"
     echo ""
     echo "  GPU          CUDA device index (e.g. 0)"
-    echo "  BENCHMARK    mipnerf360 | tanksandtemples | deepblending | bungeenerf"
-    echo "  SCENE        scene name (e.g. bicycle, truck, DrJohnson, rome)"
+    echo "  BENCHMARK    mipnerf360 | tanksandtemples | deepblending | bungeenerf | dnerf"
+    echo "  SCENE        scene name (e.g. bicycle, truck, DrJohnson, rome, bouncingballs)"
     exit 1
 fi
 
@@ -54,6 +55,18 @@ case "$BENCHMARK" in
         DATA_FACTOR=1
         REFINE_STOP=25000
         ;;
+    dnerf)
+        DATA_DIR="${WORKSPACE_DIR}/benchmark/DNeRF/${SCENE}"
+        DATA_FACTOR=1
+        REFINE_STOP=50000
+        # D-NeRF automatically enables deformation field
+        DEFORMATION_ARGS="--enable_deformation \
+            --deformation_resolution 64 64 64 150 \
+            --deformation_feature_dim 16 \
+            --deformation_multires 1 2 \
+            --deformation_hidden_dim 256 \
+            --deformation_num_layers 2"
+        ;;
     bungeenerf)
         DATA_DIR="${WORKSPACE_DIR}/benchmark/BungeeNeRF/${SCENE}"
         DATA_FACTOR=1
@@ -61,7 +74,7 @@ case "$BENCHMARK" in
         ;;
     *)
         echo "Unknown benchmark: $BENCHMARK"
-        echo "Choose from: mipnerf360, tanksandtemples, deepblending, bungeenerf"
+        echo "Choose from: mipnerf360, tanksandtemples, deepblending, bungeenerf, dnerf"
         exit 1
         ;;
 esac
@@ -75,6 +88,9 @@ echo "Scene:      ${SCENE}"
 echo "Data dir:   ${DATA_DIR}"
 echo "Data factor:${DATA_FACTOR}"
 echo "Result dir: ${RESULT_DIR}"
+if [ "${BENCHMARK}" = "dnerf" ]; then
+    echo "Deformation: ENABLED (HexPlane)"
+fi
 echo "===================="
 
 CUDA_VISIBLE_DEVICES=${GPU} python "${REPO_DIR}/train.py" mcmc \
@@ -92,4 +108,5 @@ CUDA_VISIBLE_DEVICES=${GPU} python "${REPO_DIR}/train.py" mcmc \
     --diffusion_include_full_subset \
     --eval-steps 49999 \
     --save-steps 49999 \
-    --disable-viewer
+    --disable-viewer \
+    ${DEFORMATION_ARGS:-}
