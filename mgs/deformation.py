@@ -207,13 +207,13 @@ class DeformationModule(nn.Module):
         num_layers: int,
         output_dim: int
     ) -> nn.Sequential:
-        """Build MLP with ReLU activation."""
+        """Build MLP with ReLU activation (not inplace to avoid gradient issues)."""
         layers = []
         for i in range(num_layers):
             in_dim = input_dim if i == 0 else hidden_dim
             layers.extend([
                 nn.Linear(in_dim, hidden_dim),
-                nn.ReLU(inplace=True)
+                nn.ReLU(inplace=False)  # Changed to False to avoid in-place operations
             ])
         layers.append(nn.Linear(hidden_dim, output_dim))
         return nn.Sequential(*layers)

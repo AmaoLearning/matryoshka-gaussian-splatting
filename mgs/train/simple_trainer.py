@@ -772,12 +772,15 @@ class Runner:
             coords_norm[..., 3] = torch.clamp(coords_norm[..., 3], -1.0, 1.0)
             
             # Query HexPlane: (B, N, feature_dim)
-            features = self.hexplane(coords_norm)
+            features = self.hexplane(coords_norm)  # (B, N, feature_dim)
             
-            # Get deformation offsets (use first batch for now)
-            dx, ds, dr, do, dsh = self.deformation_module(features[0])  # (N, ...)
+            # Get deformation offsets from first batch
+            # IMPORTANT: Use .clone() to avoid in-place modification of the view features[0]
+            # which would break the gradient computation graph
+            features_first = features[0].clone()  # (N, feature_dim)
+            dx, ds, dr, do, dsh = self.deformation_module(features_first)  # (N, ...)
             
-            # Apply deformation
+            # Apply deformation to Gaussian parameters
             deformed = apply_deformation(
                 means=overrides["means"],
                 scales=overrides["scales"],
@@ -791,6 +794,7 @@ class Runner:
                 dsh=dsh,
             )
             
+            # Update overrides with deformed parameters
             overrides["means"], overrides["scales"], overrides["quats"], overrides["opacities"], sh_deformed = deformed
             if sh_deformed is not None:
                 overrides["shN"] = sh_deformed
