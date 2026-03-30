@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint
 from typing import List, Optional, Tuple, Literal
 
 
@@ -26,12 +27,14 @@ class HexPlaneField(nn.Module):
         feature_dim: int = 16,
         multires: List[int] = [1, 2],
         device: str = "cuda",
+        use_gradient_checkpointing: bool = False,
     ):
         super().__init__()
         self.resolution = resolution
         self.feature_dim = feature_dim
         self.multires = multires
         self.device = device
+        self.use_gradient_checkpointing = use_gradient_checkpointing
         
         # 6 planes: XY, XZ, YZ, XT, YT, ZT
         self.plane_dims = ["XY", "XZ", "YZ", "XT", "YT", "ZT"]
@@ -51,10 +54,11 @@ class HexPlaneField(nn.Module):
         self._init_grids()
     
     def _init_grids(self):
-        """Initialize feature grids with small random values."""
+        """Initialize feature grids with small random values for stability."""
         for grids in self.feature_grids:
             for plane in grids:
-                nn.init.xavier_uniform_(plane.data)
+                # Use small initialization for numerical stability
+                nn.init.uniform_(plane.data, -0.01, 0.01)
     
     def forward(self, coords: Tensor) -> Tensor:
         """
@@ -66,6 +70,13 @@ class HexPlaneField(nn.Module):
         Returns:
             features: (B, N, feature_dim * len(multires))
         """
+        if self.use_gradient_checkpointing and self.training:
+            return checkpoint(self._forward_impl, coords, use_reentrant=False)
+        else:
+            return self._forward_impl(coords)
+    
+    def _forward_impl(self, coords: Tensor) -> Tensor:
+        """Implementation of forward pass."""
         B, N, _ = coords.shape
         all_features = []
         
@@ -94,12 +105,16 @@ class HexPlaneField(nn.Module):
                 # We treat N points as a 1×N image
                 grid = grid_coords.unsqueeze(1)  # (B, 1, N, 2)
                 
+                # Clamp coordinates to [-1, 1] to avoid numerical issues in backward pass
+                grid = torch.clamp(grid, -1.0, 1.0)
+                
                 # Sample from plane: (B, feature_dim, 1, N)
+                # Use zeros padding mode for stable gradient computation
                 sampled = F.grid_sample(
                     plane.expand(B, -1, -1, -1),
                     grid,
                     mode='bilinear',
-                    padding_mode='border',
+                    padding_mode='zeros',  # Changed from 'border' for stability
                     align_corners=True
                 )
                 

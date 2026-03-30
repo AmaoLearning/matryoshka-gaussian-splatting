@@ -263,6 +263,8 @@ class Config:
     deformation_reg_weight: float = 1e-5
     # Weight for time smoothness regularization
     deformation_time_smooth_weight: float = 1e-4
+    # Use gradient checkpointing for deformation module (memory efficient but slower)
+    deformation_gradient_checkpointing: bool = False
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -600,11 +602,15 @@ class Runner:
         self.deformation_module = None
         self.deformation_optimizers = []
         if cfg.enable_deformation:
+            # Use gradient checkpointing for memory efficiency if enabled
+            use_gradient_checkpointing = getattr(cfg, 'deformation_gradient_checkpointing', False)
+            
             self.hexplane = HexPlaneField(
                 resolution=cfg.deformation_resolution,
                 feature_dim=cfg.deformation_feature_dim,
                 multires=cfg.deformation_multires,
                 device=self.device,
+                use_gradient_checkpointing=use_gradient_checkpointing,
             ).to(self.device)
             
             # Compute feature dimension from multires
@@ -750,14 +756,23 @@ class Runner:
             coords = torch.cat([means_expanded, time_expanded], dim=-1)
             
             # Normalize coordinates to [-1, 1] for grid_sample
-            # Spatial: divide by scene_scale to get [-1, 1] range
+            # Spatial: divide by scene_scale to get approximately [-1, 1] range
             # Temporal: already in [0, 1], map to [-1, 1]
             coords_norm = coords.clone()
-            coords_norm[..., :3] = coords[..., :3] / self.scene_scale  # [-1, 1] assuming centered
-            coords_norm[..., 3] = coords[..., 3] * 2.0 - 1.0  # [0, 1] -> [-1, 1]
             
-            # Query HexPlane
-            features = self.hexplane(coords_norm)  # (B, N, feature_dim)
+            # Normalize spatial coordinates based on scene extent
+            # Add small epsilon to avoid division by zero
+            coords_norm[..., :3] = coords[..., :3] / (self.scene_scale + 1e-8)
+            
+            # Clamp spatial coords to [-1, 1] for numerical stability
+            coords_norm[..., :3] = torch.clamp(coords_norm[..., :3], -1.0, 1.0)
+            
+            # Normalize temporal coordinate: [0, 1] -> [-1, 1]
+            coords_norm[..., 3] = coords[..., 3] * 2.0 - 1.0
+            coords_norm[..., 3] = torch.clamp(coords_norm[..., 3], -1.0, 1.0)
+            
+            # Query HexPlane: (B, N, feature_dim)
+            features = self.hexplane(coords_norm)
             
             # Get deformation offsets (use first batch for now)
             dx, ds, dr, do, dsh = self.deformation_module(features[0])  # (N, ...)
