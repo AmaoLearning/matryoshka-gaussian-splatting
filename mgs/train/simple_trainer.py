@@ -714,27 +714,27 @@ class Runner:
         """
         subset_indices = subset_indices.to(self.device).long()
         overrides: Dict[str, Tensor] = {
-            "means": torch.index_select(self.splats["means"], 0, subset_indices),
-            "quats": torch.index_select(self.splats["quats"], 0, subset_indices),
-            "scales": torch.index_select(self.splats["scales"], 0, subset_indices),
+            "means": torch.index_select(self.splats["means"], 0, subset_indices).clone(),
+            "quats": torch.index_select(self.splats["quats"], 0, subset_indices).clone(),
+            "scales": torch.index_select(self.splats["scales"], 0, subset_indices).clone(),
             "opacities": torch.index_select(
                 self.splats["opacities"], 0, subset_indices
-            ),
+            ).clone(),
         }
         if self.cfg.app_opt:
             overrides["features"] = torch.index_select(
                 self.splats["features"], 0, subset_indices
-            )
+            ).clone()
             overrides["colors"] = torch.index_select(
                 self.splats["colors"], 0, subset_indices
-            )
+            ).clone()
         else:
             overrides["sh0"] = torch.index_select(
                 self.splats["sh0"], 0, subset_indices
-            )
+            ).clone()
             overrides["shN"] = torch.index_select(
                 self.splats["shN"], 0, subset_indices
-            )
+            ).clone()
         
         # Apply deformation if enabled
         if apply_deformation_fn and self.cfg.enable_deformation and time_coords is not None:
