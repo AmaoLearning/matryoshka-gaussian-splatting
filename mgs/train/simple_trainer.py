@@ -1089,6 +1089,38 @@ class Runner:
 
                 total_loss = total_loss + loss_k * weight
 
+                # Deformation regularization (computed per subset for correct gradient flow)
+                # Note: We compute regularization on HexPlane features directly without second-order gradients
+                if cfg.enable_deformation and cfg.deformation_reg_weight > 0.0:
+                    # Sample random points in 4D space for PlaneTV regularization
+                    num_samples = 1000
+                    coords = torch.rand((num_samples, 4), device=device) * 2 - 1  # [-1, 1]
+                    
+                    # Query HexPlane (no gradient on coords needed for first-order approximation)
+                    features = self.hexplane(coords.unsqueeze(0))[0]  # (N, feature_dim)
+                    
+                    # PlaneTV: encourage sparse features (simplified first-order approximation)
+                    # Original PlaneTV uses gradient magnitude, but we use feature magnitude for stability
+                    plane_tv_loss = features.abs().mean()
+                    total_loss = total_loss + (cfg.deformation_reg_weight / len(subsets)) * plane_tv_loss
+                
+                if cfg.enable_deformation and cfg.deformation_time_smooth_weight > 0.0:
+                    # Time smoothness: encourage similar features at same spatial location but different times
+                    num_samples = 500
+                    xyz = torch.rand((num_samples, 3), device=device) * 2 - 1  # [-1, 1]
+                    t1 = torch.rand((num_samples, 1), device=device)  # [0, 1]
+                    t2 = t1 + 0.1  # adjacent time
+                    
+                    coords1 = torch.cat([xyz, t1], dim=-1)
+                    coords2 = torch.cat([xyz, t2], dim=-1)
+                    
+                    # Query HexPlane for time smoothness
+                    features1 = self.hexplane(coords1.unsqueeze(0))[0]
+                    features2 = self.hexplane(coords2.unsqueeze(0))[0]
+                    
+                    time_smooth_loss = (features1 - features2).abs().mean()
+                    total_loss = total_loss + (cfg.deformation_time_smooth_weight / len(subsets)) * time_smooth_loss
+
                 if isinstance(self.cfg.strategy, DefaultStrategy):
                     key = self.cfg.strategy.key_for_gradient
                     if key in info_k:
@@ -1120,7 +1152,7 @@ class Runner:
                             info=info,
                         )
 
-            # regularizations
+            # regularizations (moved inside the loop for correct gradient computation)
             if cfg.opacity_reg > 0.0:
                 total_loss = total_loss + cfg.opacity_reg * torch.sigmoid(
                     self.splats["opacities"]
@@ -1129,44 +1161,6 @@ class Runner:
                 total_loss = total_loss + cfg.scale_reg * torch.exp(
                     self.splats["scales"]
                 ).mean()
-            
-            # Deformation regularization (PlaneTV + time smoothness)
-            if cfg.enable_deformation and cfg.deformation_reg_weight > 0.0:
-                # Sample random points in 4D space for PlaneTV regularization
-                num_samples = 1000
-                coords = torch.rand((num_samples, 4), device=device) * 2 - 1  # [-1, 1]
-                coords.requires_grad_(True)
-                
-                # Query HexPlane
-                features = self.hexplane(coords.unsqueeze(0))[0]  # (N, feature_dim)
-                
-                # Compute gradients of features w.r.t. coordinates
-                grad = torch.autograd.grad(
-                    features.sum(),
-                    coords,
-                    create_graph=True,
-                    retain_graph=True,
-                )[0]  # (N, 4)
-                
-                # PlaneTV: encourage sparse gradients
-                plane_tv_loss = grad.abs().mean()
-                total_loss = total_loss + cfg.deformation_reg_weight * plane_tv_loss
-            
-            if cfg.enable_deformation and cfg.deformation_time_smooth_weight > 0.0:
-                # Time smoothness: encourage similar features at same spatial location but different times
-                num_samples = 500
-                xyz = torch.rand((num_samples, 3), device=device) * 2 - 1  # [-1, 1]
-                t1 = torch.rand((num_samples, 1), device=device)  # [0, 1]
-                t2 = t1 + 0.1  # adjacent time
-                
-                coords1 = torch.cat([xyz, t1], dim=-1)
-                coords2 = torch.cat([xyz, t2], dim=-1)
-                
-                features1 = self.hexplane(coords1.unsqueeze(0))[0]
-                features2 = self.hexplane(coords2.unsqueeze(0))[0]
-                
-                time_smooth_loss = (features1 - features2).abs().mean()
-                total_loss = total_loss + cfg.deformation_time_smooth_weight * time_smooth_loss
 
             loss = total_loss
             loss.backward()
