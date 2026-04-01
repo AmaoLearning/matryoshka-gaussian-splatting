@@ -756,20 +756,20 @@ class Runner:
             coords = torch.cat([means_expanded, time_expanded], dim=-1)
             
             # Normalize coordinates to [-1, 1] for grid_sample
-            # Spatial: divide by scene_scale to get approximately [-1, 1] range
-            # Temporal: already in [0, 1], map to [-1, 1]
-            coords_norm = coords.clone()
+            # Avoid inplace operations (slice assignment) to preserve autograd graph
             
-            # Normalize spatial coordinates based on scene extent
-            # Add small epsilon to avoid division by zero
-            coords_norm[..., :3] = coords[..., :3] / (self.scene_scale + 1e-8)
+            # Spatial: divide by scene_scale and clamp to [-1, 1]
+            spatial_norm = torch.clamp(
+                coords[..., :3] / (self.scene_scale + 1e-8), -1.0, 1.0
+            )
             
-            # Clamp spatial coords to [-1, 1] for numerical stability
-            coords_norm[..., :3] = torch.clamp(coords_norm[..., :3], -1.0, 1.0)
+            # Temporal: [0, 1] -> [-1, 1] and clamp
+            temporal_norm = torch.clamp(
+                coords[..., 3:4] * 2.0 - 1.0, -1.0, 1.0
+            )
             
-            # Normalize temporal coordinate: [0, 1] -> [-1, 1]
-            coords_norm[..., 3] = coords[..., 3] * 2.0 - 1.0
-            coords_norm[..., 3] = torch.clamp(coords_norm[..., 3], -1.0, 1.0)
+            # Concatenate without inplace modification
+            coords_norm = torch.cat([spatial_norm, temporal_norm], dim=-1)
             
             # Query HexPlane: (B, N, feature_dim)
             features = self.hexplane(coords_norm)  # (B, N, feature_dim)
