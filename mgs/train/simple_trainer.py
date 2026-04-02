@@ -1292,6 +1292,9 @@ class Runner:
             for optimizer in self.app_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+            for optimizer in self.deformation_optimizers:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
             for scheduler in schedulers:
                 scheduler.step()
 
@@ -1438,6 +1441,25 @@ class Runner:
             masks = data["mask"].to(device) if "mask" in data else None
             height, width = pixels.shape[1:3]
 
+            # Build deformation overrides if enabled
+            splat_overrides: Optional[Dict[str, Tensor]] = None
+            if cfg.enable_deformation and self.deformation_module is not None:
+                time_coords = None
+                if "time" in data:
+                    time_coords = data["time"].to(device)
+                elif "frame_id" in data:
+                    max_frames = len(self.valset)
+                    time_coords = data["frame_id"].float().to(device) / max_frames
+                if time_coords is None:
+                    time_coords = torch.zeros((1,), device=device)
+                # Build overrides with deformation for all splats
+                all_indices = torch.arange(len(self.splats["means"]), device=device)
+                splat_overrides = self._build_subset_overrides(
+                    subset_indices=all_indices,
+                    apply_deformation_fn=True,
+                    time_coords=time_coords,
+                )
+
             torch.cuda.synchronize()
             tic = time.time()
             colors, _, _ = self.rasterize_splats(
@@ -1449,6 +1471,7 @@ class Runner:
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 masks=masks,
+                splat_overrides=splat_overrides,
             )  # [1, H, W, 3]
             torch.cuda.synchronize()
             elapsed = max(time.time() - tic, 1e-10)
@@ -1534,6 +1557,7 @@ class Runner:
 
         sort_indices = self.sorter.argsort(self.splats)
         total_splats = len(sort_indices)
+        use_deformation = cfg.enable_deformation and self.deformation_module is not None
         subset_entries = []
         for idx, split in enumerate(cfg.mgs_splits):
             n_keep = int(total_splats * split)
@@ -1542,36 +1566,39 @@ class Runner:
             n_keep = min(n_keep, total_splats)
             split_str = self._format_split_label(split)
             label = f"{idx:02d}_{split_str}"
-            subset_entries.append(
-                {
-                    "split": split,
-                    "label": label,
-                    "num_splats": n_keep,
-                    "mrl_position": False,
-                    "overrides": self._build_subset_overrides(
-                        sort_indices[:n_keep]
-                    ),
-                    "metrics": defaultdict(list),
-                    "times": [],
-                }
-            )
+            entry: Dict[str, Any] = {
+                "split": split,
+                "label": label,
+                "num_splats": n_keep,
+                "mrl_position": False,
+                "subset_indices": sort_indices[:n_keep],
+                "metrics": defaultdict(list),
+                "times": [],
+            }
+            # Pre-build static overrides only for non-deformation case
+            if not use_deformation:
+                entry["overrides"] = self._build_subset_overrides(
+                    sort_indices[:n_keep]
+                )
+            subset_entries.append(entry)
         if cfg.mgs_splits_mrl:
             for n_requested in cfg.mgs_splits_mrl:
                 n_keep = max(1, min(int(n_requested), total_splats))
                 label = f"mrl_{n_keep}"
-                subset_entries.append(
-                    {
-                        "split": n_keep / total_splats,
-                        "label": label,
-                        "num_splats": n_keep,
-                        "mrl_position": True,
-                        "overrides": self._build_subset_overrides(
-                            sort_indices[:n_keep]
-                        ),
-                        "metrics": defaultdict(list),
-                        "times": [],
-                    }
-                )
+                entry = {
+                    "split": n_keep / total_splats,
+                    "label": label,
+                    "num_splats": n_keep,
+                    "mrl_position": True,
+                    "subset_indices": sort_indices[:n_keep],
+                    "metrics": defaultdict(list),
+                    "times": [],
+                }
+                if not use_deformation:
+                    entry["overrides"] = self._build_subset_overrides(
+                        sort_indices[:n_keep]
+                    )
+                subset_entries.append(entry)
 
         for i, data in enumerate(dataloader):
             camtoworlds = data["camtoworld"].to(device)
@@ -1580,8 +1607,29 @@ class Runner:
             masks = data["mask"].to(device) if "mask" in data else None
             height, width = pixels.shape[1:3]
 
+            # Get time coordinate for this frame (needed for deformation)
+            time_coords: Optional[torch.Tensor] = None
+            if use_deformation:
+                if "time" in data:
+                    time_coords = data["time"].to(device)
+                elif "frame_id" in data:
+                    max_frames = len(dataset)
+                    time_coords = data["frame_id"].float().to(device) / max_frames
+                if time_coords is None:
+                    time_coords = torch.zeros((1,), device=device)
+
             for subset in subset_entries:
                 target_pixels = torch.clamp(pixels, 0.0, 1.0)
+
+                # Build overrides: use cached static or per-frame deformation
+                if use_deformation:
+                    current_overrides = self._build_subset_overrides(
+                        subset_indices=subset["subset_indices"],
+                        apply_deformation_fn=True,
+                        time_coords=time_coords,
+                    )
+                else:
+                    current_overrides = subset["overrides"]
 
                 torch.cuda.synchronize()
                 tic = time.time()
@@ -1594,7 +1642,7 @@ class Runner:
                     near_plane=cfg.near_plane,
                     far_plane=cfg.far_plane,
                     masks=masks,
-                    splat_overrides=subset["overrides"],
+                    splat_overrides=current_overrides,
                 )
                 torch.cuda.synchronize()
                 elapsed = max(time.time() - tic, 1e-10)
